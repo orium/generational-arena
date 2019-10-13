@@ -173,13 +173,15 @@ pub struct Arena<T> {
     items: Vec<Entry<T>>,
     generation: u64,
     free_list_head: Option<usize>,
+    occupied_first: Option<usize>,
+    occupied_last: Option<usize>,
     len: usize,
 }
 
 #[derive(Clone, Debug)]
 enum Entry<T> {
     Free { next_free: Option<usize> },
-    Occupied { generation: u64, value: T },
+    Occupied { generation: u64, value: T, prev: Option<usize>, next: Option<usize> },
 }
 
 /// An index (and generation) into an `Arena`.
@@ -271,6 +273,8 @@ impl<T> Arena<T> {
             items: Vec::new(),
             generation: 0,
             free_list_head: None,
+            occupied_first: None,
+            occupied_last: None,
             len: 0,
         };
         arena.reserve(n);
@@ -342,12 +346,29 @@ impl<T> Arena<T> {
             Some(i) => match self.items[i] {
                 Entry::Occupied { .. } => panic!("corrupt free list"),
                 Entry::Free { next_free } => {
+                    let old_last = self.occupied_last;
+
+                    self.occupied_last = Some(i);
                     self.free_list_head = next_free;
                     self.len += 1;
                     self.items[i] = Entry::Occupied {
                         generation: self.generation,
                         value,
+                        prev: old_last,
+                        next: None
                     };
+
+                    if let Some(l) = old_last {
+                        match self.items[l] {
+                            Entry::Occupied { ref mut next, .. } => *next = Some(i),
+                            _ => unreachable!(),
+                        }
+                    }
+
+                    if self.occupied_first.is_none() {
+                        self.occupied_first = Some(i);
+                    }
+
                     Ok(Index {
                         index: i,
                         generation: self.generation,
@@ -420,7 +441,28 @@ impl<T> Arena<T> {
                 self.len -= 1;
 
                 match entry {
-                    Entry::Occupied { generation: _, value } => Some(value),
+                    Entry::Occupied { generation: _, value, prev, next } => {
+                        if let Some(p) = prev {
+                            match self.items[p] {
+                                Entry::Occupied { next: ref mut prev_next, .. } => *prev_next = next,
+                                _ => unreachable!(),
+                            }
+                        }
+                        if let Some(n) = next {
+                            match self.items[n] {
+                                Entry::Occupied { prev: ref mut next_prev, .. } => *next_prev = prev,
+                                _ => unreachable!(),
+                            }
+                        }
+                        if Some(i.index) == self.occupied_last {
+                            self.occupied_last = prev;
+                        }
+                        if Some(i.index) == self.occupied_first {
+                            self.occupied_first = next;
+                        }
+
+                        Some(value)
+                    },
                     _ => unreachable!(),
                 }
             }
@@ -449,7 +491,7 @@ impl<T> Arena<T> {
     pub fn retain(&mut self, mut predicate: impl FnMut(Index, &T) -> bool) {
         for i in 0..self.len {
             let remove = match &self.items[i] {
-                Entry::Occupied { generation, value } => {
+                Entry::Occupied { generation, value, .. } => {
                     let index = Index {
                         index: i,
                         generation: *generation,
@@ -511,6 +553,7 @@ impl<T> Arena<T> {
             Some(Entry::Occupied {
                 generation,
                 value,
+                ..
             }) if *generation == i.generation => Some(value),
             _ => None,
         }
@@ -538,6 +581,7 @@ impl<T> Arena<T> {
             Some(Entry::Occupied {
                 generation,
                 value,
+                ..
             }) if *generation == i.generation => Some(value),
             _ => None,
         }
@@ -603,6 +647,7 @@ impl<T> Arena<T> {
             Entry::Occupied {
                 generation,
                 value,
+                ..
             } if *generation == i1.generation => Some(value),
             _ => None,
         };
@@ -611,6 +656,7 @@ impl<T> Arena<T> {
             Entry::Occupied {
                 generation,
                 value,
+                ..
             } if *generation == i2.generation => Some(value),
             _ => None,
         };
@@ -844,7 +890,7 @@ impl<T> IntoIterator for Arena<T> {
 /// }
 /// ```
 #[derive(Clone, Debug)]
-pub struct IntoIter<T> {
+pub struct IntoIter<T> { // WIP!
     len: usize,
     inner: vec::IntoIter<Entry<T>>,
 }
@@ -928,7 +974,7 @@ impl<'a, T> IntoIterator for &'a Arena<T> {
 /// }
 /// ```
 #[derive(Clone, Debug)]
-pub struct Iter<'a, T: 'a> {
+pub struct Iter<'a, T: 'a> {  // WIP!
     len: usize,
     inner: iter::Enumerate<slice::Iter<'a, Entry<T>>>,
 }
@@ -945,6 +991,7 @@ impl<'a, T> Iterator for Iter<'a, T> {
                     &Entry::Occupied {
                         generation,
                         ref value,
+                        ..
                     },
                 )) => {
                     self.len -= 1;
@@ -974,6 +1021,7 @@ impl<'a, T> DoubleEndedIterator for Iter<'a, T> {
                     &Entry::Occupied {
                         generation,
                         ref value,
+                        ..
                     },
                 )) => {
                     self.len -= 1;
@@ -1026,7 +1074,7 @@ impl<'a, T> IntoIterator for &'a mut Arena<T> {
 /// }
 /// ```
 #[derive(Debug)]
-pub struct IterMut<'a, T: 'a> {
+pub struct IterMut<'a, T: 'a> {  // WIP!
     len: usize,
     inner: iter::Enumerate<slice::IterMut<'a, Entry<T>>>,
 }
@@ -1043,6 +1091,7 @@ impl<'a, T> Iterator for IterMut<'a, T> {
                     &mut Entry::Occupied {
                         generation,
                         ref mut value,
+                        ..
                     },
                 )) => {
                     self.len -= 1;
@@ -1072,6 +1121,7 @@ impl<'a, T> DoubleEndedIterator for IterMut<'a, T> {
                     &mut Entry::Occupied {
                         generation,
                         ref mut value,
+                        ..
                     },
                 )) => {
                     self.len -= 1;
@@ -1121,7 +1171,7 @@ impl<'a, T> FusedIterator for IterMut<'a, T> {}
 /// assert!(arena.get(idx_2).is_none());
 /// ```
 #[derive(Debug)]
-pub struct Drain<'a, T: 'a> {
+pub struct Drain<'a, T: 'a> {  // WIP!
     inner: iter::Enumerate<vec::Drain<'a, Entry<T>>>,
 }
 
@@ -1132,7 +1182,7 @@ impl<'a, T> Iterator for Drain<'a, T> {
         loop {
             match self.inner.next() {
                 Some((_, Entry::Free { .. })) => continue,
-                Some((index, Entry::Occupied { generation, value })) => {
+                Some((index, Entry::Occupied { generation, value, .. })) => {
                     let idx = Index { index, generation };
                     return Some((idx, value));
                 }
