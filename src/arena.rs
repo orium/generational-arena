@@ -1,168 +1,14 @@
-/*!
-[![](https://docs.rs/generational-arena/badge.svg)](https://docs.rs/generational-arena/)
-[![](https://img.shields.io/crates/v/generational-arena.svg)](https://crates.io/crates/generational-arena)
-[![](https://img.shields.io/crates/d/generational-arena.svg)](https://crates.io/crates/generational-arena)
-[![Travis CI Build Status](https://travis-ci.org/fitzgen/generational-arena.svg?branch=master)](https://travis-ci.org/fitzgen/generational-arena)
-
-A safe arena allocator that allows deletion without suffering from [the ABA
-problem](https://en.wikipedia.org/wiki/ABA_problem) by using generational
-indices.
-
-Inspired by [Catherine West's closing keynote at RustConf
-2018](http://rustconf.com/program.html#closingkeynote), where these ideas
-were presented in the context of an Entity-Component-System for games
-programming.
-
-## What? Why?
-
-Imagine you are working with a graph and you want to add and delete individual
-nodes at a time, or you are writing a game and its world consists of many
-inter-referencing objects with dynamic lifetimes that depend on user
-input. These are situations where matching Rust's ownership and lifetime rules
-can get tricky.
-
-It doesn't make sense to use shared ownership with interior mutability (ie
-`Rc<RefCell<T>>` or `Arc<Mutex<T>>`) nor borrowed references (ie `&'a T` or `&'a
-mut T`) for structures. The cycles rule out reference counted types, and the
-required shared mutability rules out borrows. Furthermore, lifetimes are dynamic
-and don't follow the borrowed-data-outlives-the-borrower discipline.
-
-In these situations, it is tempting to store objects in a `Vec<T>` and have them
-reference each other via their indices. No more borrow checker or ownership
-problems! Often, this solution is good enough.
-
-However, now we can't delete individual items from that `Vec<T>` when we no
-longer need them, because we end up either
-
-* messing up the indices of every element that follows the deleted one, or
-
-* suffering from the [ABA
-  problem](https://en.wikipedia.org/wiki/ABA_problem). To elaborate further, if
-  we tried to replace the `Vec<T>` with a `Vec<Option<T>>`, and delete an
-  element by setting it to `None`, then we create the possibility for this buggy
-  sequence:
-
-    * `obj1` references `obj2` at index `i`
-
-    * someone else deletes `obj2` from index `i`, setting that element to `None`
-
-    * a third thing allocates `obj3`, which ends up at index `i`, because the
-      element at that index is `None` and therefore available for allocation
-
-    * `obj1` attempts to get `obj2` at index `i`, but incorrectly is given
-      `obj3`, when instead the get should fail.
-
-By introducing a monotonically increasing generation counter to the collection,
-associating each element in the collection with the generation when it was
-inserted, and getting elements from the collection with the *pair* of index and
-the generation at the time when the element was inserted, then we can solve the
-aforementioned ABA problem. When indexing into the collection, if the index
-pair's generation does not match the generation of the element at that index,
-then the operation fails.
-
-## Features
-
-* Zero `unsafe`
-* Well tested, including quickchecks
-* `no_std` compatibility
-* All the trait implementations you expect: `IntoIterator`, `FromIterator`,
-  `Extend`, etc...
-
-## Usage
-
-First, add `generational-arena` to your `Cargo.toml`:
-
-```toml
-[dependencies]
-generational-arena = "0.1"
-```
-
-Then, import the crate and use the
-[`generational_arena::Arena`](./struct.Arena.html) type!
-
-```rust
-extern crate generational_arena;
-use generational_arena::Arena;
-
-let mut arena = Arena::new();
-
-// Insert some elements into the arena.
-let rza = arena.insert("Robert Fitzgerald Diggs");
-let gza = arena.insert("Gary Grice");
-let bill = arena.insert("Bill Gates");
-
-// Inserted elements can be accessed infallibly via indexing (and missing
-// entries will panic).
-assert_eq!(arena[rza], "Robert Fitzgerald Diggs");
-
-// Alternatively, the `get` and `get_mut` methods provide fallible lookup.
-if let Some(genius) = arena.get(gza) {
-    println!("The gza gza genius: {}", genius);
-}
-if let Some(val) = arena.get_mut(bill) {
-    *val = "Bill Gates doesn't belong in this set...";
-}
-
-// We can remove elements.
-arena.remove(bill);
-
-// Insert a new one.
-let murray = arena.insert("Bill Murray");
-
-// The arena does not contain `bill` anymore, but it does contain `murray`, even
-// though they are almost certainly at the same index within the arena in
-// practice. Ambiguities are resolved with an associated generation tag.
-assert!(!arena.contains(bill));
-assert!(arena.contains(murray));
-
-// Iterate over everything inside the arena.
-for (idx, value) in &arena {
-    println!("{:?} is at {:?}", value, idx);
-}
-```
-
-## `no_std`
-
-To enable `no_std` compatibility, disable the on-by-default "std" feature. This
-currently requires nightly Rust and `feature(alloc)` to get access to `Vec`.
-
-```toml
-[dependencies]
-generational-arena = { version = "0.2", default-features = false }
-```
-
-### Serialization and Deserialization with [`serde`](https://crates.io/crates/serde)
-
-To enable serialization/deserialization support, enable the "serde" feature.
-
-```toml
-[dependencies]
-generational-arena = { version = "0.2", features = ["serde"] }
-```
- */
-
-#![forbid(unsafe_code, missing_docs, missing_debug_implementations)]
-#![no_std]
-#![cfg_attr(not(feature = "std"), feature(alloc))]
-
-cfg_if::cfg_if! {
-    if #[cfg(feature = "std")] {
-        extern crate std;
-        use std::vec::{self, Vec};
-    } else {
-        extern crate alloc;
-        use alloc::vec::{self, Vec};
-    }
-}
-
 use core::cmp;
 use core::iter::{self, Extend, FromIterator, FusedIterator};
 use core::mem;
 use core::ops;
 use core::slice;
+use smallvec::SmallVec;
 
 #[cfg(feature = "serde")]
 mod serde_impl;
+
+const DEFAULT_CAPACITY: usize = 16;
 
 /// The `Arena` allows inserting and removing elements that are referred to by
 /// `Index`.
@@ -170,7 +16,7 @@ mod serde_impl;
 /// [See the module-level documentation for example usage and motivation.](./index.html)
 #[derive(Clone, Debug)]
 pub struct Arena<T> {
-    items: Vec<Entry<T>>,
+    items: SmallVec<[Entry<T>; DEFAULT_CAPACITY]>,
     generation: u64,
     free_list_head: Option<usize>,
     len: usize,
@@ -229,8 +75,6 @@ impl Index {
     }
 }
 
-const DEFAULT_CAPACITY: usize = 4;
-
 impl<T> Arena<T> {
     /// Constructs a new, empty `Arena`.
     ///
@@ -243,7 +87,22 @@ impl<T> Arena<T> {
     /// # let _ = arena;
     /// ```
     pub fn new() -> Arena<T> {
-        Arena::with_capacity(DEFAULT_CAPACITY)
+        debug_assert!(DEFAULT_CAPACITY > 0);
+
+        let mut items: SmallVec<[Entry<T>; DEFAULT_CAPACITY]> = SmallVec::new();
+
+        for i in 0..(DEFAULT_CAPACITY - 1) {
+            items.push(Entry::Free { next_free: Some(i + 1) });
+        }
+
+        items.push(Entry::Free { next_free: None });
+
+        Arena {
+            items,
+            generation: 0,
+            free_list_head: Some(0),
+            len: 0,
+        }
     }
 
     /// Constructs a new, empty `Arena<T>` with the specified capacity.
@@ -267,12 +126,7 @@ impl<T> Arena<T> {
     /// ```
     pub fn with_capacity(n: usize) -> Arena<T> {
         let n = cmp::max(n, 1);
-        let mut arena = Arena {
-            items: Vec::new(),
-            generation: 0,
-            free_list_head: None,
-            len: 0,
-        };
+        let mut arena = Arena::new();
         arena.reserve(n);
         arena
     }
@@ -381,8 +235,7 @@ impl<T> Arena<T> {
 
     #[inline(never)]
     fn insert_slow_path(&mut self, value: T) -> Index {
-        let len = self.items.len();
-        self.reserve(len);
+        self.reserve(self.items.len());
         self.try_insert(value)
             .map_err(|_| ())
             .expect("inserting will always succeed after reserving additional space")
@@ -746,7 +599,7 @@ impl<T> Arena<T> {
     ///     println!("{} is at index {:?}", value, idx);
     /// }
     /// ```
-    pub fn iter(&self) -> Iter<T> {
+    pub fn iter(&self) -> Iter<'_, T> {
         Iter {
             len: self.len,
             inner: self.items.iter().enumerate(),
@@ -773,7 +626,7 @@ impl<T> Arena<T> {
     ///     *value += 5;
     /// }
     /// ```
-    pub fn iter_mut(&mut self) -> IterMut<T> {
+    pub fn iter_mut(&mut self) -> IterMut<'_, T> {
         IterMut {
             len: self.len,
             inner: self.items.iter_mut().enumerate(),
@@ -805,9 +658,9 @@ impl<T> Arena<T> {
     /// assert!(arena.get(idx_1).is_none());
     /// assert!(arena.get(idx_2).is_none());
     /// ```
-    pub fn drain(&mut self) -> Drain<T> {
+    pub fn drain(&mut self) -> Drain<'_, T> {
         Drain {
-            inner: self.items.drain(..).enumerate(),
+            inner: self.items.drain().enumerate(),
         }
     }
 }
@@ -843,10 +696,9 @@ impl<T> IntoIterator for Arena<T> {
 ///     assert!(value < 100);
 /// }
 /// ```
-#[derive(Clone, Debug)]
 pub struct IntoIter<T> {
     len: usize,
-    inner: vec::IntoIter<Entry<T>>,
+    inner: smallvec::IntoIter<[Entry<T>; DEFAULT_CAPACITY]>,
 }
 
 impl<T> Iterator for IntoIter<T> {
@@ -928,7 +780,7 @@ impl<'a, T> IntoIterator for &'a Arena<T> {
 /// }
 /// ```
 #[derive(Clone, Debug)]
-pub struct Iter<'a, T: 'a> {
+pub struct Iter<'a, T> {
     len: usize,
     inner: iter::Enumerate<slice::Iter<'a, Entry<T>>>,
 }
@@ -1026,7 +878,7 @@ impl<'a, T> IntoIterator for &'a mut Arena<T> {
 /// }
 /// ```
 #[derive(Debug)]
-pub struct IterMut<'a, T: 'a> {
+pub struct IterMut<'a, T> {
     len: usize,
     inner: iter::Enumerate<slice::IterMut<'a, Entry<T>>>,
 }
@@ -1120,9 +972,8 @@ impl<'a, T> FusedIterator for IterMut<'a, T> {}
 /// assert!(arena.get(idx_1).is_none());
 /// assert!(arena.get(idx_2).is_none());
 /// ```
-#[derive(Debug)]
-pub struct Drain<'a, T: 'a> {
-    inner: iter::Enumerate<vec::Drain<'a, Entry<T>>>,
+pub struct Drain<'a, T> {
+    inner: iter::Enumerate<smallvec::Drain<'a, Entry<T>>>,
 }
 
 impl<'a, T> Iterator for Drain<'a, T> {
